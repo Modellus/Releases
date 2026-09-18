@@ -1,0 +1,163 @@
+name: Build installers
+
+# The application is private, so this build cannot be started by a push to it: a repository's own
+# token reaches only itself. It is started by hand instead, and once a day, and the daily run stops
+# unless the application's main has moved since the release was last built.
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if the application has not moved"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.look.outputs.sha }}
+      build: ${{ steps.look.outputs.build }}
+    steps:
+      - name: What the application is at, and what was last built
+        id: look
+        env:
+          EDITOR_REPO_SSH_KEY: ${{ secrets.EDITOR_REPO_SSH_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf "%s\n" "$EDITOR_REPO_SSH_KEY" > ~/.ssh/editor
+          chmod 600 ~/.ssh/editor
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          sha=$(GIT_SSH_COMMAND="ssh -i ~/.ssh/editor -o IdentitiesOnly=yes" git ls-remote git@github.com:Modellus/EditorHtml.git main | cut -f1)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          built=$(gh release view latest --repo ${{ github.repository }} --json body --jq .body 2>/dev/null | grep -oE '[0-9a-f]{40}' | head -1 || true)
+          echo "application is at $sha; the release was built from ${built:-nothing}"
+          if [ "$sha" = "$built" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: decide
+    if: needs.decide.outputs.build == 'yes'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: "dist/*.dmg"
+            release-name: Modellus-mac.dmg
+          - os: windows-latest
+            artifact: "dist/*.exe"
+            release-name: Modellus-windows.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # Two deploy keys, because one key cannot be a deploy key on two repositories: one reads the
+      # application, the other the shared files it carries as a submodule. A host alias each, so that
+      # ssh offers the right one rather than the first one.
+      - name: Check out the application and its shared files
+        shell: bash
+        env:
+          EDITOR_REPO_SSH_KEY: ${{ secrets.EDITOR_REPO_SSH_KEY }}
+          SHARED_REPO_SSH_KEY: ${{ secrets.SHARED_REPO_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf "%s\n" "$EDITOR_REPO_SSH_KEY" > ~/.ssh/editor
+          printf "%s\n" "$SHARED_REPO_SSH_KEY" > ~/.ssh/shared
+          chmod 600 ~/.ssh/editor ~/.ssh/shared
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          {
+            echo "Host gh-editor"
+            echo "  HostName github.com"
+            echo "  User git"
+            echo "  IdentityFile ~/.ssh/editor"
+            echo "  IdentitiesOnly yes"
+            echo "Host gh-shared"
+            echo "  HostName github.com"
+            echo "  User git"
+            echo "  IdentityFile ~/.ssh/shared"
+            echo "  IdentitiesOnly yes"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          git clone --quiet git@gh-editor:Modellus/EditorHtml.git application
+          cd application
+          git checkout --quiet ${{ needs.decide.outputs.sha }}
+          git config submodule.shared.url git@gh-shared:Modellus/Shared.git
+          git submodule update --init
+          test -f shared/common.css
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: application/package-lock.json
+
+      - name: Install dependencies
+        working-directory: application
+        run: npm ci
+
+      - name: Build offline assets
+        working-directory: application
+        run: npm run build:offline
+
+      - name: Build app
+        working-directory: application
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist -- --publish never
+
+      - name: Rename artifact to fixed name
+        shell: bash
+        working-directory: application
+        run: |
+          src=$(ls ${{ matrix.artifact }} | head -1)
+          dir=$(dirname "$src")
+          cp "$src" "$dir/${{ matrix.release-name }}"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: modellus-${{ runner.os }}
+          path: application/dist/${{ matrix.release-name }}
+          if-no-files-found: error
+
+  release:
+    needs: [decide, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: modellus-macOS
+          path: artifacts
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: modellus-Windows
+          path: artifacts
+
+      - name: Create or update latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: latest
+          name: Latest Build
+          body: |
+            The current Modellus desktop installers.
+
+            Built from Modellus/EditorHtml at ${{ needs.decide.outputs.sha }}
+          prerelease: false
+          make_latest: true
+          files: |
+            artifacts/Modellus-mac.dmg
+            artifacts/Modellus-windows.exe
