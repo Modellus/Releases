@@ -91,6 +91,11 @@ jobs:
           git config submodule.shared.url git@gh-shared:Modellus/Shared.git
           git submodule update --init
           test -f shared/common.css
+          # electron-builder reads the git remote to work out where it would publish to. The host
+          # alias above is not a host it knows, and it stops on the null that gives it, so the
+          # remote is put back to the address the application actually lives at. Nothing fetches
+          # from it again.
+          git remote set-url origin https://github.com/Modellus/EditorHtml.git
 
       - uses: actions/setup-node@v5
         with:
